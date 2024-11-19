@@ -1,0 +1,22 @@
+# 数据目录
+data_folder: ./organized_ravdess
+train_annotation: ./organized_ravdess/train.json
+valid_annotation: ./organized_ravdess/train.json
+test_annotation: ./organized_ravdess/test.json
+
+# 模块配置
+modules:
+  model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
+    input_size: 80
+    lin_neurons: 192
+    activation: !name:torch.nn.ReLU
+
+# 优化器配置
+opt_class: !name:torch.optim.Adam
+lr: 0.001
+
+# 检查点
+checkpointer:
+  checkpoints_dir: ./results/checkpoints
+  recoverables:
+    model: !ref <modules.model>
