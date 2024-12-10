@@ -1,143 +1,100 @@
-import os
+from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+from datasets import Dataset
 import torch
-import speechbrain as sb
-import torch.nn as nn
-from speechbrain.lobes.models.ECAPA_TDNN import ECAPA_TDNN
-from speechbrain.lobes.features import Fbank
-from speechbrain.processing.features import InputNormalization
+import soundfile as sf
+from transformers import TrainingArguments, Trainer
+from datasets import load_metric
+import os
+import pandas as pd
 
-# Custom ECAPA_TDNN model with InstanceNorm1d replacing BatchNorm1d
-class CustomECAPA_TDNN(ECAPA_TDNN):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.replace_batchnorm_with_instancenorm()
+emotion_map = {
+    "01": "neutral",
+    "02": "calm",
+    "03": "happy",
+    "04": "sad",
+    "05": "angry",
+    "06": "fearful",
+    "07": "disgust",
+    "08": "surprised"
+}
 
-    def replace_batchnorm_with_instancenorm(self):
-        # Recursively replace all BatchNorm1d with InstanceNorm1d
-        for name, module in self.named_modules():
-            if isinstance(module, nn.BatchNorm1d):
-                new_module = nn.InstanceNorm1d(
-                    module.num_features,
-                    affine=module.affine,
-                    track_running_stats=False
-                )
-                parent_name = ".".join(name.split(".")[:-1])
-                attr_name = name.split(".")[-1]
-                if parent_name == "":
-                    setattr(self, attr_name, new_module)
-                else:
-                    parent_module = dict(self.named_modules())[parent_name]
-                    setattr(parent_module, attr_name, new_module)
+def parse_filename(file_name):
+    parts = file_name.split("-")
+    emotion_label = parts[2]
+    return int(emotion_label) - 1
 
-    def forward(self, x):
-        residual = x
-        for i, layer in enumerate(self.blocks):
-            x = layer(x)
-            if i == 0:
-                residual = x
-            elif i <= 2:
-                residual = torch.cat((residual, x), dim=1)
+def parse_actor(file_name):
+    parts = file_name.split("-")
+    return int(parts[-1].split(".")[0])
 
-        x = self.mfa(residual)
-        x = self.asp_bn(x)
-        x = self.fc(x)
-        return x
+def create_metadata(audio_dir):
+    data = []
+    for file_name in os.listdir(audio_dir):
+        if file_name.endswith(".wav"):
+            file_path = os.path.join(audio_dir, file_name)
+            label = parse_filename(file_name)
+            actor = parse_actor(file_name)
+            data.append({"path": file_path, "label": label, "actor": actor})
+    return pd.DataFrame(data)
 
-# Data preparation function
-def dataio_prep(data_folder, train_json, test_json):
-    @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig")
-    def audio_pipeline(wav):
-        sig = sb.dataio.dataio.read_audio(wav)
-        return sig
+audio_dir = "path_to_audio_files"
+metadata = create_metadata(audio_dir)
 
-    @sb.utils.data_pipeline.takes("emo")
-    @sb.utils.data_pipeline.provides("emo", "emo_encoded")
-    def label_pipeline(emo):
-        yield emo
-        yield label_encoder.encode_label_torch(emo)
+train_test_split = metadata.sample(frac=0.9, random_state=42), metadata.sample(frac=0.1, random_state=42)
+train_metadata, test_metadata = train_test_split
 
-    datasets = {
-        "train": sb.dataio.dataset.DynamicItemDataset.from_json(
-            json_path=train_json,
-            replacements={"data_root": data_folder},
-            dynamic_items=[audio_pipeline, label_pipeline],
-            output_keys=["id", "sig", "emo", "emo_encoded"],
-        ),
-        "test": sb.dataio.dataset.DynamicItemDataset.from_json(
-            json_path=test_json,
-            replacements={"data_root": data_folder},
-            dynamic_items=[audio_pipeline, label_pipeline],
-            output_keys=["id", "sig", "emo", "emo_encoded"],
-        ),
-    }
+train_dataset = Dataset.from_pandas(train_metadata)
+test_dataset = Dataset.from_pandas(test_metadata)
 
-    label_encoder = sb.dataio.encoder.CategoricalEncoder()
-    label_encoder.load_or_create(
-        path=os.path.join(data_folder, "label_encoder.txt"),
-        from_didatasets=[datasets["train"]],
-    )
-    return datasets, label_encoder
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
 
-# Custom Brain
-class EmoIdBrain(sb.Brain):
-    def compute_forward(self, batch, stage):
-        batch = batch.to(self.device)
-        wavs, lens = batch.sig
+def preprocess_function(batch):
+    speech, rate = sf.read(batch["path"])
+    inputs = processor(speech, sampling_rate=rate, return_tensors="pt", padding=True)
+    inputs["labels"] = torch.tensor(batch["label"])
+    return inputs
 
-        feats = self.hparams.fbank(wavs)
-        feats = self.hparams.normalizer(feats, lens)
+train_dataset = train_dataset.map(preprocess_function, remove_columns=["path", "actor"])
+test_dataset = test_dataset.map(preprocess_function, remove_columns=["path", "actor"])
 
-        feats = feats.transpose(1, 2)
+model = Wav2Vec2ForSequenceClassification.from_pretrained(
+    "facebook/wav2vec2-large-xlsr-53",
+    num_labels=len(emotion_map),
+    problem_type="single_label_classification",
+    hidden_dropout_prob=0.1,
+)
+model.freeze_feature_encoder()
 
-        embeddings = self.modules.embedding_model(feats)
-        outputs = self.modules.classifier(embeddings)
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=1e-3,
+    per_device_train_batch_size=32,
+    num_train_epochs=10,
+    logging_dir="./logs",
+    logging_steps=50,
+    save_total_limit=2,
+    warmup_steps=500,
+    weight_decay=0.01,
+)
 
-        return outputs
+metric = load_metric("accuracy")
 
-    def compute_objectives(self, predictions, batch, stage):
-        loss = sb.nnet.losses.nll_loss(predictions, batch.emo_encoded)
-        return loss
+def compute_metrics(pred):
+    predictions = torch.argmax(torch.tensor(pred.predictions), axis=1)
+    return metric.compute(predictions=predictions.numpy(), references=pred.label_ids)
 
-# Main function
-if __name__ == "__main__":
-    data_folder = "./organized_ravdess"
-    train_json = os.path.join(data_folder, "train.json")
-    test_json = os.path.join(data_folder, "test.json")
-    output_folder = "./results"
-    os.makedirs(output_folder, exist_ok=True)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    tokenizer=processor,
+    compute_metrics=compute_metrics,
+)
 
-    model = CustomECAPA_TDNN(input_size=80, lin_neurons=192)
+trainer.train()
 
-    modules = {
-        "embedding_model": model,
-        "classifier": torch.nn.Linear(3072, 8),
-    }
-
-    hparams = {
-        "fbank": Fbank(n_mels=80),
-        "normalizer": InputNormalization(),
-    }
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    brain = EmoIdBrain(
-        modules=modules,
-        opt_class=lambda x: optimizer,
-        hparams=hparams,
-        run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-        checkpointer=sb.utils.checkpoints.Checkpointer(
-            checkpoints_dir=os.path.join(output_folder, "checkpoints"),
-            recoverables={"model": model, "optimizer": optimizer},
-        ),
-    )
-
-    datasets, label_encoder = dataio_prep(data_folder, train_json, test_json)
-
-    brain.fit(
-        epoch_counter=range(1, 11),
-        train_set=datasets["train"],
-        valid_set=None,
-    )
-
-    brain.evaluate(datasets["test"])
+model.save_pretrained("./wav2vec2-emotion")
+processor.save_pretrained("./wav2vec2-emotion")
