@@ -1,11 +1,11 @@
-from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+from sklearn.model_selection import KFold
+from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification, TrainingArguments, Trainer
 from datasets import Dataset
 import torch
 import soundfile as sf
-from transformers import TrainingArguments, Trainer
-from datasets import load_metric
 import os
 import pandas as pd
+from datasets import load_metric
 
 emotion_map = {
     "01": "neutral",
@@ -40,11 +40,13 @@ def create_metadata(audio_dir):
 audio_dir = "path_to_audio_files"
 metadata = create_metadata(audio_dir)
 
-train_test_split = metadata.sample(frac=0.9, random_state=42), metadata.sample(frac=0.1, random_state=42)
-train_metadata, test_metadata = train_test_split
-
-train_dataset = Dataset.from_pandas(train_metadata)
-test_dataset = Dataset.from_pandas(test_metadata)
+folds = {
+    0: [2, 5, 14, 15, 16],
+    1: [3, 6, 7, 13, 18],
+    2: [10, 11, 12, 19, 20],
+    3: [8, 17, 21, 23, 24],
+    4: [1, 4, 9, 22, 25],
+}
 
 processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
 
@@ -54,47 +56,56 @@ def preprocess_function(batch):
     inputs["labels"] = torch.tensor(batch["label"])
     return inputs
 
-train_dataset = train_dataset.map(preprocess_function, remove_columns=["path", "actor"])
-test_dataset = test_dataset.map(preprocess_function, remove_columns=["path", "actor"])
+def train_on_fold(train_df, val_df, fold_index):
+    train_dataset = Dataset.from_pandas(train_df)
+    val_dataset = Dataset.from_pandas(val_df)
 
-model = Wav2Vec2ForSequenceClassification.from_pretrained(
-    "facebook/wav2vec2-large-xlsr-53",
-    num_labels=len(emotion_map),
-    problem_type="single_label_classification",
-    hidden_dropout_prob=0.1,
-)
-model.freeze_feature_encoder()
+    train_dataset = train_dataset.map(preprocess_function, remove_columns=["path", "actor"])
+    val_dataset = val_dataset.map(preprocess_function, remove_columns=["path", "actor"])
 
-training_args = TrainingArguments(
-    output_dir="./results",
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    learning_rate=1e-3,
-    per_device_train_batch_size=32,
-    num_train_epochs=10,
-    logging_dir="./logs",
-    logging_steps=50,
-    save_total_limit=2,
-    warmup_steps=500,
-    weight_decay=0.01,
-)
+    model = Wav2Vec2ForSequenceClassification.from_pretrained(
+        "facebook/wav2vec2-large-xlsr-53",
+        num_labels=len(emotion_map),
+        problem_type="single_label_classification",
+        hidden_dropout_prob=0.1,
+    )
+    model.freeze_feature_encoder()
 
-metric = load_metric("accuracy")
+    training_args = TrainingArguments(
+        output_dir=f"./results_fold_{fold_index}",
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-3,
+        per_device_train_batch_size=32,
+        num_train_epochs=10,
+        logging_dir=f"./logs_fold_{fold_index}",
+        logging_steps=50,
+        save_total_limit=2,
+        warmup_steps=500,
+        weight_decay=0.01,
+    )
 
-def compute_metrics(pred):
-    predictions = torch.argmax(torch.tensor(pred.predictions), axis=1)
-    return metric.compute(predictions=predictions.numpy(), references=pred.label_ids)
+    metric = load_metric("accuracy")
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    tokenizer=processor,
-    compute_metrics=compute_metrics,
-)
+    def compute_metrics(pred):
+        predictions = torch.argmax(torch.tensor(pred.predictions), axis=1)
+        return metric.compute(predictions=predictions.numpy(), references=pred.label_ids)
 
-trainer.train()
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=processor,
+        compute_metrics=compute_metrics,
+    )
 
-model.save_pretrained("./wav2vec2-emotion")
-processor.save_pretrained("./wav2vec2-emotion")
+    trainer.train()
+
+    model.save_pretrained(f"./wav2vec2-emotion-fold{fold_index}")
+    processor.save_pretrained(f"./wav2vec2-emotion-fold{fold_index}")
+
+for fold_index, actors in folds.items():
+    val_df = metadata[metadata["actor"].isin(actors)]
+    train_df = metadata[~metadata["actor"].isin(actors)]
+    train_on_fold(train_df, val_df, fold_index)
